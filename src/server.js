@@ -7,8 +7,10 @@ const crypto = require('crypto');
 const multer = require('multer');
 const { z } = require('zod');
 const { AssemblyAI } = require('assemblyai');
-const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
-const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
+// MCP SDK v2: implements the current revision (2026-07-28, stateless, server/discover)
+// and still serves legacy initialize-based clients statelessly.
+const { McpServer, createMcpHandler } = require('@modelcontextprotocol/server');
+const { toNodeHandler } = require('@modelcontextprotocol/node');
 const { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } = require('@modelcontextprotocol/sdk/server/auth/router.js');
 const { requireBearerAuth } = require('@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js');
 
@@ -27,7 +29,8 @@ const AUTH_TOKEN = process.env.AUTH_TOKEN; // static owner token (own harness)
 const OWNER_PASSWORD = process.env.OWNER_PASSWORD || AUTH_TOKEN; // consent page password
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
-const VERSION = '2.0.0';
+const MAX_MCP_BODY_BYTES = 40 * 1024 * 1024; // base64 uploads inflate ~4/3
+const VERSION = '2.1.0';
 
 const MCP_URL = new URL(`${BASE_URL}/mcp`);
 const DOCS_URL = new URL(`${BASE_URL}/docs`);
@@ -262,31 +265,19 @@ app.get('/.well-known/oauth-protected-resource', (req, res) => {
 
 const bearerAuth = requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl: RESOURCE_METADATA_URL });
 
-// Streamable HTTP transport, stateless: a fresh server + transport per request.
-app.post('/mcp', bearerAuth, express.json({ limit: '40mb' }), async (req, res) => {
-  const server = buildMcpServer();
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
-  res.on('close', () => {
-    transport.close();
-    server.close();
-  });
-  try {
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-  } catch (err) {
-    console.error('MCP request failed:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null });
-    }
-  }
+// MCP endpoint. Modern (2026-07-28) requests are served statelessly per request,
+// including server/discover; legacy initialize-based requests fall back to the
+// SDK's stateless legacy serving (GET/DELETE answer 405).
+const mcpHandler = createMcpHandler(() => buildMcpServer(), {
+  legacy: 'stateless',
+  maxRequestBodySize: MAX_MCP_BODY_BYTES,
+  onerror: (err) => console.error('MCP:', err.message)
 });
-
-// Stateless server: no SSE stream, no sessions to delete.
-app.all('/mcp', bearerAuth, (req, res) => {
-  res.set('Allow', 'POST').status(405).json({
-    jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null
-  });
+const mcpNodeHandler = toNodeHandler(mcpHandler, {
+  maxRequestBodySize: MAX_MCP_BODY_BYTES,
+  onerror: (err) => console.error('MCP adapter:', err)
 });
+app.all('/mcp', bearerAuth, express.json({ limit: MAX_MCP_BODY_BYTES }), (req, res) => mcpNodeHandler(req, res, req.body));
 
 // Plain HTTP upload (multipart), same auth as /mcp.
 const multipartUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_UPLOAD_BYTES } });
@@ -314,7 +305,7 @@ app.get('/docs', (req, res) => {
 </style></head><body>
 <h1>MEGA Devs MCP Server: plan</h1>
 <p>A remote MCP server with four tools: memos, file upload and audio transcription.
-MCP endpoint: <code>${MCP_URL.href}</code> (Streamable HTTP, JSON-RPC 2.0, MCP revision 2025-11-25; older revisions negotiated by the SDK).</p>
+MCP endpoint: <code>${MCP_URL.href}</code> (Streamable HTTP, JSON-RPC 2.0, current MCP revision 2026-07-28: stateless, <code>server/discover</code>, per-request <code>_meta</code>; legacy clients using the <code>initialize</code> handshake (2025-11-25 and earlier) are still served).</p>
 
 <h2>What the tools do</h2>
 <table>
