@@ -30,7 +30,7 @@ const OWNER_PASSWORD = process.env.OWNER_PASSWORD || AUTH_TOKEN; // consent page
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_MCP_BODY_BYTES = 40 * 1024 * 1024; // base64 uploads inflate ~4/3
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
 
 const MCP_URL = new URL(`${BASE_URL}/mcp`);
 const DOCS_URL = new URL(`${BASE_URL}/docs`);
@@ -107,30 +107,66 @@ async function fetchRemote(url) {
   return Buffer.from(await res.arrayBuffer());
 }
 
+const NON_AUDIO_TYPE = /^(text\/|application\/(json|xml|xhtml\+xml|javascript|pdf|zip))|html|xml/i;
+
+// Checks that the url is reachable and serves media before paying for a transcription,
+// so errors name the url and say what is wrong with it.
+async function checkAudioUrl(url) {
+  let parsed;
+  try { parsed = new URL(url); } catch (_) { throw new Error(`The url "${url}" is not a valid URL.`); }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error(`The url ${url} is not an http(s) link. Give a direct public link to an audio file.`);
+  }
+  let res;
+  try {
+    res = await fetch(parsed, { headers: { Range: 'bytes=0-1023' }, redirect: 'follow', signal: AbortSignal.timeout(15000) });
+  } catch (e) {
+    throw new Error(`Could not reach the url ${url}: ${e.cause?.code || e.message}.`);
+  }
+  try { await res.body?.cancel(); } catch (_) { /* ignore */ }
+  if (!res.ok) {
+    throw new Error(`The url ${url} returned HTTP ${res.status}. It must be a public link anyone can download, pointing at an audio file.`);
+  }
+  const type = (res.headers.get('content-type') || '').split(';')[0].trim();
+  if (type && NON_AUDIO_TYPE.test(type)) {
+    const what = /html/i.test(type) ? 'a web page' : 'not audio';
+    throw new Error(`The url ${url} is not an audio file: it serves ${type} (${what}). Give a direct link to an audio or video file such as .mp3, .wav or .m4a.`);
+  }
+}
+
+const secs = (ms) => Math.round(ms / 10) / 100; // ms -> seconds, 2 decimals
+
 async function transcribe(url) {
-  if (!assemblyai) throw new Error('Transcription is not configured on this server');
-  const transcript = await assemblyai.transcripts.transcribe({ audio_url: url });
-  if (transcript.status === 'error') throw new Error(transcript.error || 'Transcription failed');
+  if (!assemblyai) throw new Error('Transcription is not configured on this server.');
+  await checkAudioUrl(url);
+  let transcript;
+  try {
+    transcript = await assemblyai.transcripts.transcribe({ audio_url: url });
+  } catch (e) {
+    throw new Error(`Transcription of ${url} failed: ${e.message}`);
+  }
+  if (transcript.status === 'error') {
+    throw new Error(`Transcription of ${url} failed: ${(transcript.error || 'unknown error').slice(0, 300)}`);
+  }
 
   let segments = [];
   try {
     const { sentences } = await assemblyai.transcripts.sentences(transcript.id);
-    segments = (sentences || []).map((s) => ({
-      start: s.start / 1000, end: s.end / 1000, text: s.text, confidence: s.confidence
-    }));
+    segments = (sentences || []).map((s) => ({ start: secs(s.start), end: secs(s.end), text: s.text }));
   } catch (_) {
     segments = [];
   }
-  if (segments.length === 0) {
-    segments = (transcript.words || []).map((w) => ({
-      start: w.start / 1000, end: w.end / 1000, text: w.text, confidence: w.confidence
-    }));
+  if (segments.length === 0 && transcript.text) {
+    const words = transcript.words || [];
+    segments = [{
+      start: words.length ? secs(words[0].start) : 0,
+      end: words.length ? secs(words[words.length - 1].end) : (transcript.audio_duration || 0),
+      text: transcript.text
+    }];
   }
   return {
     segments,
-    text: transcript.text || '',
-    ...(typeof transcript.audio_duration === 'number' ? { duration: transcript.audio_duration } : {}),
-    ...(transcript.language_code ? { language: transcript.language_code } : {})
+    ...(typeof transcript.audio_duration === 'number' ? { duration: transcript.audio_duration } : {})
   };
 }
 
@@ -209,22 +245,24 @@ function buildMcpServer() {
 
   server.registerTool('transcribe', {
     title: 'Transcribe audio',
-    description: 'Turns audio at a public URL into timestamped text segments (sentence level, start/end in seconds).',
-    inputSchema: { url: z.string().url().describe('Public URL of the audio file') },
+    description: 'Turns audio at a public URL into timestamped text: sentence segments with start/end in seconds (2 decimals). Compact result; the url must point directly at an audio or video file.',
+    inputSchema: { url: z.string().url().describe('Direct public URL of an audio or video file (e.g. .mp3, .wav, .m4a)') },
     outputSchema: {
       segments: z.array(z.object({
         start: z.number().describe('Start time in seconds'),
         end: z.number().describe('End time in seconds'),
-        text: z.string(),
-        confidence: z.number().optional()
+        text: z.string()
       })),
-      text: z.string().describe('Full transcript'),
-      duration: z.number().optional().describe('Audio duration in seconds'),
-      language: z.string().optional()
+      duration: z.number().optional().describe('Audio duration in seconds')
     },
     annotations: { readOnlyHint: true, openWorldHint: true }
   }, async ({ url }) => {
-    try { return ok(await transcribe(url)); } catch (e) { return fail(new Error(`Transcription failed: ${e.message}`)); }
+    try {
+      const data = await transcribe(url);
+      // Text content is a compact human-readable copy (no escaped JSON) to keep results small.
+      const lines = data.segments.map((seg) => `[${seg.start}-${seg.end}] ${seg.text}`).join('\n');
+      return { content: [{ type: 'text', text: lines || '(no speech found)' }], structuredContent: data };
+    } catch (e) { return fail(e); }
   });
 
   return server;
@@ -313,7 +351,7 @@ MCP endpoint: <code>${MCP_URL.href}</code> (Streamable HTTP, JSON-RPC 2.0, curre
 <tr><td><code>memo_write</code></td><td><code>{ text }</code></td><td><code>{ id }</code>: saves a note.</td></tr>
 <tr><td><code>memo_search</code></td><td><code>{ query }</code></td><td><code>{ notes: [{ id, text, created_at, updated_at }] }</code>: full-text search, all words must match, newest first, max 100. Empty query returns the newest notes.</td></tr>
 <tr><td><code>upload</code></td><td><code>{ filename?, content_base64 | text | source_url }</code></td><td><code>{ url, filename, size }</code>: stores the file; <code>url</code> is a public link served by this server under <code>/files/</code>.</td></tr>
-<tr><td><code>transcribe</code></td><td><code>{ url }</code></td><td><code>{ segments: [{ start, end, text, confidence }], text, duration?, language? }</code>: sentence-level segments, times in seconds (AssemblyAI).</td></tr>
+<tr><td><code>transcribe</code></td><td><code>{ url }</code></td><td><code>{ segments: [{ start, end, text }], duration? }</code>: sentence-level segments, times in seconds (2 decimals), compact (AssemblyAI). The url must point directly at an audio or video file; errors name the url and say what is wrong.</td></tr>
 </table>
 <p>Every tool declares an <code>outputSchema</code>; results come back as <code>structuredContent</code> matching it, plus the same JSON as text content. Errors come back as <code>isError: true</code>.</p>
 
